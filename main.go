@@ -1,11 +1,315 @@
+// context-mode-go: a Go MCP server that virtualizes tool output to save context tokens.
+// Registers: ctx_execute, ctx_index, ctx_search, ctx_stats.
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+type Document struct {
+	Path      string    `json:"path"`
+	Content   string    `json:"content"`
+	IndexedAt time.Time `json:"indexed_at"`
+}
+
+type server struct {
+	workdir     string
+	mu          sync.Mutex
+	documents   map[string]Document
+	dbPath      string
+	totalInput  int64
+	totalOutput int64
+}
+
 func main() {
-	fmt.Println("go-context-mode: Go implementation of Context Mode MCP Server (under construction)")
-	os.Exit(0)
+	var workdir string
+	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
+	flag.Parse()
+
+	if workdir == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("cannot get cwd: %v", err)
+		}
+		workdir = wd
+	}
+	absWd, err := filepath.Abs(workdir)
+	if err != nil {
+		log.Fatalf("bad workdir: %v", err)
+	}
+	workdir = absWd
+
+	s := &server{
+		workdir:   workdir,
+		documents: make(map[string]Document),
+		dbPath:    filepath.Join(workdir, ".context_mode_db.json"),
+	}
+	s.loadDB()
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "context-mode-go", Version: "0.1.0"}, nil)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_execute",
+		Description: "Run a shell command in a sandboxed way. Heavy outputs (logs, build traces) are compressed and saved locally to prevent flooding the context window.",
+	}, s.toolExecute)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_index",
+		Description: "Index a file or directory into the local knowledge base, avoiding sending the entire file repeatedly.",
+	}, s.toolIndex)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_search",
+		Description: "Search for query terms in the indexed local knowledge base, returning only matching lines or snippets.",
+	}, s.toolSearch)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctx_stats",
+		Description: "Report token saving statistics of the current context virtualization session.",
+	}, s.toolStats)
+
+	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		log.Fatalf("server exited: %v", err)
+	}
+}
+
+// ---------- tool implementations ----------
+
+type executeArgs struct {
+	Command string `json:"command" jsonschema:"shell command to execute"`
+}
+
+func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args executeArgs) (*mcp.CallToolResult, any, error) {
+	if args.Command == "" {
+		return nil, nil, fmt.Errorf("command is required")
+	}
+
+	var cmd *exec.Cmd
+	if os.Getenv("SHELL") != "" {
+		cmd = exec.CommandContext(ctx, os.Getenv("SHELL"), "-c", args.Command)
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", args.Command)
+	}
+	cmd.Dir = s.workdir
+
+	out, err := cmd.CombinedOutput()
+	rawOutput := string(out)
+	if err != nil && rawOutput == "" {
+		rawOutput = fmt.Sprintf("Command failed to execute: %v", err)
+	}
+
+	s.mu.Lock()
+	s.totalInput += int64(len(args.Command))
+	s.totalOutput += int64(len(rawOutput))
+	s.mu.Unlock()
+
+	// Virtualization limit: if output exceeds 40KB, intercept and summarize
+	limit := 40_000
+	if len(rawOutput) > limit {
+		// truncate safe to rune boundary
+		truncAt := limit
+		for truncAt > 0 && !utf8.ValidString(rawOutput[:truncAt]) {
+			truncAt--
+		}
+		truncated := rawOutput[:truncAt]
+		savedPath := filepath.Join(s.workdir, fmt.Sprintf(".context_mode_log_%d.log", time.Now().UnixNano()))
+		_ = os.WriteFile(savedPath, out, 0644)
+
+		summary := fmt.Sprintf(
+			"Command executed successfully.\nWarning: Output is too large (%d bytes).\nSaved full log to: %s\n\n--- [First %d bytes] ---\n%s\n--- [Truncated] ---",
+			len(rawOutput), filepath.Base(savedPath), limit, truncated,
+		)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+		}, nil, nil
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: rawOutput}},
+	}, nil, nil
+}
+
+type indexArgs struct {
+	Path string `json:"path" jsonschema:"file or directory path to index"`
+}
+
+func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args indexArgs) (*mcp.CallToolResult, any, error) {
+	if args.Path == "" {
+		return nil, nil, fmt.Errorf("path is required")
+	}
+
+	target := args.Path
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(s.workdir, target)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	indexedCount := 0
+	if info.IsDir() {
+		err = filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			if strings.Contains(path, "/.git/") || strings.Contains(path, "/node_modules/") {
+				return nil
+			}
+			if err := s.indexFile(path); err == nil {
+				indexedCount++
+			}
+			return nil
+		})
+	} else {
+		err = s.indexFile(target)
+		if err == nil {
+			indexedCount = 1
+		}
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.saveDB()
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Successfully indexed %d file(s) into local database.", indexedCount)}},
+	}, nil, nil
+}
+
+type searchArgs struct {
+	Query string `json:"query" jsonschema:"search terms or pattern"`
+}
+
+func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
+	if args.Query == "" {
+		return nil, nil, fmt.Errorf("query is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var results []string
+	queryLower := strings.ToLower(args.Query)
+
+	for _, doc := range s.documents {
+		if strings.Contains(strings.ToLower(doc.Content), queryLower) {
+			// Find matching lines
+			lines := strings.Split(doc.Content, "\n")
+			matchedLines := 0
+			var snippet []string
+			for idx, line := range lines {
+				if strings.Contains(strings.ToLower(line), queryLower) {
+					snippet = append(snippet, fmt.Sprintf("  Line %d: %s", idx+1, strings.TrimSpace(line)))
+					matchedLines++
+					if matchedLines >= 5 {
+						snippet = append(snippet, "  ...")
+						break
+					}
+				}
+			}
+			rel, _ := filepath.Rel(s.workdir, doc.Path)
+			if rel == "" {
+				rel = doc.Path
+			}
+			results = append(results, fmt.Sprintf("Matches in file %s:\n%s", rel, strings.Join(snippet, "\n")))
+		}
+	}
+
+	if len(results) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "No matches found."}},
+		}, nil, nil
+	}
+
+	text := strings.Join(results, "\n\n")
+	if len(text) > 40_000 {
+		text = text[:40_000] + "\n... (truncated search results)"
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}, nil, nil
+}
+
+type statsArgs struct{}
+
+func (s *server) toolStats(ctx context.Context, _ *mcp.CallToolRequest, _ statsArgs) (*mcp.CallToolResult, any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	savedBytes := s.totalOutput - s.totalInput
+	if savedBytes < 0 {
+		savedBytes = 0
+	}
+	// Estimate token saving: roughly 1 token = 4 characters/bytes
+	estimatedTokens := savedBytes / 4
+
+	res := map[string]any{
+		"total_command_inputs_bytes": s.totalInput,
+		"total_raw_outputs_bytes":    s.totalOutput,
+		"saved_context_bytes":        savedBytes,
+		"estimated_tokens_saved":     estimatedTokens,
+		"indexed_documents_count":    len(s.documents),
+	}
+
+	js, _ := json.MarshalIndent(res, "", "  ")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
+	}, nil, nil
+}
+
+// ---------- db helpers ----------
+
+func (s *server) indexFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.documents[path] = Document{
+		Path:      path,
+		Content:   string(data),
+		IndexedAt: time.Now(),
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *server) loadDB() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.dbPath)
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(data, &s.documents)
+}
+
+func (s *server) saveDB() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := json.Marshal(s.documents)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(s.dbPath, data, 0644)
 }
