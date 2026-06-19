@@ -1,3 +1,3 @@
-module github.com/dorokuma/go-context-mode
+module github.com/dorokuma/context-mode-go
 
 go 1.24.4
