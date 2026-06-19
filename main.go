@@ -125,12 +125,12 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 			truncAt--
 		}
 		truncated := rawOutput[:truncAt]
-		savedPath := filepath.Join(s.workdir, fmt.Sprintf(".context_mode_log_%d.log", time.Now().UnixNano()))
+		savedPath := filepath.Join(os.TempDir(), fmt.Sprintf("context_mode_log_%d.log", time.Now().UnixNano()))
 		_ = os.WriteFile(savedPath, out, 0644)
 
 		summary := fmt.Sprintf(
 			"Command executed successfully.\nWarning: Output is too large (%d bytes).\nSaved full log to: %s\n\n--- [First %d bytes] ---\n%s\n--- [Truncated] ---",
-			len(rawOutput), filepath.Base(savedPath), limit, truncated,
+			len(rawOutput), savedPath, limit, truncated,
 		)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
@@ -170,12 +170,18 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 			if strings.Contains(path, "/.git/") || strings.Contains(path, "/node_modules/") {
 				return nil
 			}
+			if isProbablyBinary(info.Name()) || info.Size() > 1*1024*1024 {
+				return nil
+			}
 			if err := s.indexFile(path); err == nil {
 				indexedCount++
 			}
 			return nil
 		})
 	} else {
+		if isProbablyBinary(info.Name()) || info.Size() > 1*1024*1024 {
+			return nil, nil, fmt.Errorf("file %q is binary or too large (> 1MB)", target)
+		}
 		err = s.indexFile(target)
 		if err == nil {
 			indexedCount = 1
@@ -312,4 +318,24 @@ func (s *server) saveDB() {
 		return
 	}
 	_ = os.WriteFile(s.dbPath, data, 0644)
+}
+
+func isProbablyBinary(name string) bool {
+	for _, ext := range []string{
+		".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".zip", ".tar", ".gz", ".bz2", ".xz", ".zst", ".7z", ".rar",
+		".exe", ".bin", ".dll", ".so", ".dylib", ".wasm",
+		".o", ".a", ".lib", ".obj",
+		".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac", ".ogg",
+		".ttf", ".otf", ".woff", ".woff2",
+		".pyc", ".pyo", ".class", ".jar",
+		".db", ".sqlite", ".sqlite3",
+		".iso", ".dmg", ".img",
+	} {
+		if strings.HasSuffix(strings.ToLower(name), ext) {
+			return true
+		}
+	}
+	return false
 }
