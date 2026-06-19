@@ -57,7 +57,9 @@ func main() {
 		documents: make(map[string]Document),
 		dbPath:    filepath.Join(workdir, ".context_mode_db.json"),
 	}
-	s.loadDB()
+	if err := s.loadDB(); err != nil {
+		log.Fatalf("failed to load database: %v", err)
+	}
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-mode-go", Version: "0.1.0"}, nil)
 
@@ -126,7 +128,7 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		truncated := rawOutput[:truncAt]
 		savedPath := filepath.Join(os.TempDir(), fmt.Sprintf("context_mode_log_%d.log", time.Now().UnixNano()))
-		_ = os.WriteFile(savedPath, out, 0644)
+		_ = os.WriteFile(savedPath, out, 0600)
 
 		summary := fmt.Sprintf(
 			"Command executed successfully.\nWarning: Output is too large (%d bytes).\nSaved full log to: %s\n\n--- [First %d bytes] ---\n%s\n--- [Truncated] ---",
@@ -151,9 +153,9 @@ func (s *server) toolIndex(ctx context.Context, _ *mcp.CallToolRequest, args ind
 		return nil, nil, fmt.Errorf("path is required")
 	}
 
-	target := args.Path
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(s.workdir, target)
+	target, err := s.resolvePath(args.Path)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	info, err := os.Stat(target)
@@ -298,15 +300,18 @@ func (s *server) indexFile(path string) error {
 	return nil
 }
 
-func (s *server) loadDB() {
+func (s *server) loadDB() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	data, err := os.ReadFile(s.dbPath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	_ = json.Unmarshal(data, &s.documents)
+	return json.Unmarshal(data, &s.documents)
 }
 
 func (s *server) saveDB() {
@@ -317,7 +322,11 @@ func (s *server) saveDB() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(s.dbPath, data, 0644)
+	tmpPath := s.dbPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmpPath, s.dbPath)
 }
 
 func isProbablyBinary(name string) bool {
@@ -338,4 +347,22 @@ func isProbablyBinary(name string) bool {
 		}
 	}
 	return false
+}
+
+// resolvePath converts a user-supplied path into an absolute path within the workspace.
+// It guarantees the result is inside s.workdir, preventing path traversal.
+func (s *server) resolvePath(p string) (string, error) {
+	if p == "" {
+		return s.workdir, nil
+	}
+	var target string
+	if filepath.IsAbs(p) {
+		target = filepath.Clean(p)
+	} else {
+		target = filepath.Clean(filepath.Join(s.workdir, p))
+	}
+	if target != s.workdir && !strings.HasPrefix(target, s.workdir+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q is outside workspace %q", p, s.workdir)
+	}
+	return target, nil
 }
