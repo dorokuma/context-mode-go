@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -60,6 +61,7 @@ func main() {
 	if err := s.loadDB(); err != nil {
 		log.Fatalf("failed to load database: %v", err)
 	}
+	s.excludeFromGit()
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-mode-go", Version: "0.1.0"}, nil)
 
@@ -101,11 +103,25 @@ func (s *server) toolExecute(ctx context.Context, _ *mcp.CallToolRequest, args e
 
 	var cmd *exec.Cmd
 	if os.Getenv("SHELL") != "" {
-		cmd = exec.CommandContext(ctx, os.Getenv("SHELL"), "-c", args.Command)
+		cmd = exec.Command(os.Getenv("SHELL"), "-c", args.Command)
 	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", args.Command)
+		cmd = exec.Command("sh", "-c", args.Command)
 	}
 	cmd.Dir = s.workdir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		case <-done:
+		}
+	}()
 
 	out, err := cmd.CombinedOutput()
 	rawOutput := string(out)
@@ -365,4 +381,25 @@ func (s *server) resolvePath(p string) (string, error) {
 		return "", fmt.Errorf("path %q is outside workspace %q", p, s.workdir)
 	}
 	return target, nil
+}
+
+// excludeFromGit appends the local database files to .git/info/exclude to avoid workspace pollution.
+func (s *server) excludeFromGit() {
+	gitDir := filepath.Join(s.workdir, ".git")
+	if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+		excludePath := filepath.Join(gitDir, "info", "exclude")
+		_ = os.MkdirAll(filepath.Dir(excludePath), 0755)
+		data, err := os.ReadFile(excludePath)
+		content := ""
+		if err == nil {
+			content = string(data)
+		}
+		if !strings.Contains(content, ".context_mode_db.json") {
+			f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				defer f.Close()
+				_, _ = f.WriteString("\n# context-mode-go local database\n.context_mode_db.json\n.context_mode_db.json.tmp\n")
+			}
+		}
+	}
 }
